@@ -1,0 +1,98 @@
+name: Release
+
+# 推送 v* 标签时自动构建 Windows 产物并发布到本仓库的 GitHub Releases。
+# 也可以在 Actions 页面手动触发并指定版本号。
+# 工作流只做「检出代码 → 构建 → 上传 Release 资源」，不会向任何分支推送代码。
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布的版本号，形如 v0.7.1'
+        required: true
+        type: string
+
+# 最小权限：仅需要写入 Release 资源，不申请代码写入权限
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建并发布 Windows x64 产物
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+      BINARY_NAME: wuthering-waves-gacha-record
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 校验标签版本与 Cargo.toml 一致
+        id: validate
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAG)) {
+            Write-Error '无法获取版本号'
+            exit 1
+          }
+          $match = Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"(.+)"$'
+          if (-not $match) {
+            Write-Error '未能在 Cargo.toml 中找到 version 字段'
+            exit 1
+          }
+          $cargoVersion = $match.Matches[0].Groups[1].Value
+          $tagVersion = $env:TAG.TrimStart('v')
+          Write-Host "标签版本：$tagVersion；Cargo.toml 版本：$cargoVersion"
+          if ($tagVersion -ne $cargoVersion) {
+            Write-Error "标签版本 $tagVersion 与 Cargo.toml 的 $cargoVersion 不一致，程序内的更新检查依赖二者一致"
+            exit 1
+          }
+          "version=$tagVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: 构建 Release
+        # 不使用 --locked：本地环境可能没有 Rust 工具链，
+        # Cargo.lock 无法随版本号同步，交给 CI 自动解析。
+        run: cargo build --release
+
+      - name: 打包产物
+        id: package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          $exe = Join-Path 'target/release' "$env:BINARY_NAME.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "未找到构建产物：$exe"
+            exit 1
+          }
+          $asset = "windows.x86_64.$env:VERSION.zip"
+          Compress-Archive -Path $exe -DestinationPath $asset -CompressionLevel Optimal
+          $size = (Get-Item $asset).Length / 1MB
+          "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          ("产物：{0}（{1:N2} MB）" -f $asset, $size) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: 发布到 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          files: ${{ steps.package.outputs.asset }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
